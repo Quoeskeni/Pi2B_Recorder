@@ -53,8 +53,8 @@
 
 ## Требования
 
-- **Плата:** Raspberry Pi (тестируется на Raspberry Pi 2B под Raspberry Pi OS / Linux)
-- **Видеограббер:** USB-свисток на базе `Fushicai UTV007` (`1b71:3002`) или `MacroSilicon MS210x` (`534d:0021`)
+- **Плата:** Raspberry Pi (тестируется на Raspberry Pi 2B под Raspberry Pi OS Lite Trixie)
+- **Видеограббер:** USB-свисток на базе `Fushicai UTV007` (`1b71:3002`), но сейчас, пока что, использую `MacroSilicon MS210x` (`534d:0021`)
 - **Python 3** и системные пакеты:
   - `pygame`, `numpy`, `PyGObject` (`gi`)
   - GStreamer 1.0 (`v4l2src`, `jpegdec`, `deinterlace`, `videoconvert`, `v4l2h264enc`, `h264parse`, `matroskamux`)
@@ -132,4 +132,4 @@ python3 main.py --test-ui
 - [ ] Полная проверка на реальном UTV007 в режиме `50p` / `59.94p`
 - [ ] Сенсорное управление и интеграция с аппаратной обвязкой (АКБ, звук, корпус)
 
-Дальше цели буду дополнять, всё пишу с помощью нейронок Gemini 4 Hydrogen и Nemotron 3.5 Super VL Free
+### Дальше цели буду дополнять, всё пишу с помощью нейронок Gemini 4 Hydrogen и Nemotron 3.5 Super VL Free. Текст ридми также был на 99% сгенерирован нейросетью. Сам я в кодинге хуже джуна))
