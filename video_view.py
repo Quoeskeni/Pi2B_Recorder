@@ -141,39 +141,43 @@ def sample_to_surface(sample):
     if not width or not height:
         return None
 
-    # Определяем формат из caps
-    caps_str = caps.to_string() if hasattr(caps, "to_string") else str(caps)
+    # Определяем формат из caps через GStreamer API (не через строку!).
+    # caps.to_string() даёт "format=(string)RGB", где \w+ не Matches "(string)",
+    # поэтому fmt оставался None и RGB-данные дешифровались как I420.
     fmt = None
-    m = re.search(r"format=(\w+)", caps_str)
-    if m:
-        fmt = m.group(1)
+    caps_str = ""
+    if _HAVE_GST:
+        try:
+            struct = caps.get_structure(0)
+            if struct is not None:
+                fmt = struct.get_value("format")
+                caps_str = str(caps)
+        except Exception:
+            pass
+    if fmt is None:
+        # фоллбэк: парсим строку caps
+        caps_str = caps.to_string() if hasattr(caps, "to_string") else str(caps)
+        m = re.search(r"format=(\w+)", caps_str)
+        if m:
+            fmt = m.group(1)
 
     buf = sample.get_buffer()
     ok, mapinfo = buf.map(Gst.MapFlags.READ)
     if not ok:
         return None
     try:
-        # Для RGB с возможным stride (выравнивание строк) используем
-        # GstVideo.VideoFrame, иначе простая копия байтов.
-        if fmt == "RGB" and _HAVE_GST_VIDEO:
-            try:
-                vinfo = GstVideo.VideoInfo.new_from_caps(caps)
-                if vinfo.width == width and vinfo.height == height:
-                    stride = vinfo.stride[0]
-                    # Копируем только нужные пиксели (без stride-заполнения),
-                    # иначе pygame.image.frombuffer с width*height*3 сломает кадр.
-                    frame = GstVideo.VideoFrame.map(vinfo, buf, Gst.MapFlags.READ)
-                    if frame is not None:
-                        data = bytes(frame.get_data())
-                        frame.unmap()
-                    else:
-                        data = bytes(mapinfo.data)
-                else:
-                    data = bytes(mapinfo.data)
-            except Exception:
-                data = bytes(mapinfo.data)
-        else:
-            data = bytes(mapinfo.data)
+        data = bytes(mapinfo.data)
+        # Для RGB есть stride-выравнивание строк (выравнивание до 4 байт).
+        # Если len(data) > width * height * 3 — обрезаем лишние байты в конце строки
+        # простым срезом NumPy, без GstVideo.VideoFrame (он возвращает кортеж, а не объект,
+        # и не вызывать .unmap() ведёт к утечке +20.5 МБ каждые 2 секунды).
+        if fmt == "RGB" and len(data) > width * height * 3:
+            import numpy as np
+            arr = np.frombuffer(data, dtype=np.uint8)
+            # reshape в (height, stride_bytes) и обрезаем до width*3
+            row_bytes = len(data) // height
+            arr = arr.reshape(height, row_bytes)[:, :width * 3]
+            data = arr.tobytes()
     finally:
         buf.unmap(mapinfo)
 
@@ -205,28 +209,51 @@ class VideoView:
     """
     Хранит последний кадр и рисует его в прямоугольнике холста.
 
+    Поддерживает два режима вывода:
+      1. Софтовый pygame.Surface (для ui_selftest.py и фоллбэка).
+      2. GPU-ускорение через SDL2 Texture (VideoCore IV / OpenGL ES),
+         когда передан renderer и video_tex.
+
     Использование из главного цикла:
         video.update(rec.pull_preview_sample())   # каждый кадр цикла
         video.draw(canvas, config.video_rect_on_canvas())
     """
 
-    def __init__(self):
-        self.surface = None
-        self._scaled = {}          # (size_исходника, size_цели) -> Surface
+    def __init__(self, use_gpu=False, renderer=None, video_tex=None):
+        self.surface = None          # pygame.Surface для софтового режима
+        self.texture = None          # SDL2 Texture для GPU-режима
+        self._renderer = renderer    # SDL2 Renderer
+        self._use_gpu = use_gpu and renderer is not None
+        self._scaled = {}            # (size_исходника, size_цели) -> Surface
+        # Привязываем внешнюю текстуру видео (создаётся в main.py)
+        if video_tex is not None:
+            self.texture = video_tex
 
     def update(self, sample):
-        """sample — Gst.Sample или None. None просто оставляет прежний кадр."""
+        """sample — Gst.Sample или None. Возвращает True, если поверхность обновилась."""
         if sample is None:
-            return
+            return False
         surf = sample_to_surface(sample)
         if surf is not None:
             self.surface = surf
             self._scaled.clear()   # масштабированная копия устарела
+            return True
+        return False
+
+    def update_gpu_texture(self):
+        """Обновить SDL2 Texture из текущего pygame.Surface (видеокадр)."""
+        if self._use_gpu and self.texture is not None and self.surface is not None:
+            try:
+                self.texture.update(self.surface)
+            except Exception as e:
+                logging.getLogger("video_view").debug(
+                    "Не удалось обновить GPU-текстуру видео: %s", e)
 
     def draw(self, canvas, rect):
         """
         Вписать кадр в rect (x, y, w, h) с сохранением пропорций.
         Возвращает True, если что-то нарисовали.
+        Софтовый режим: рисует на pygame.Surface canvas.
         """
         if self.surface is None:
             return False
@@ -245,3 +272,20 @@ class VideoView:
         canvas.blit(scaled, (dst.x + (dst.width - size[0]) // 2,
                              dst.y + (dst.height - size[1]) // 2))
         return True
+
+    def draw_gpu(self, renderer):
+        """
+        Нарисовать видео-текстуру на SDL2 Renderer (GPU-режим).
+        Вызывается из main.py вместо soft draw().
+        """
+        if not self._use_gpu or self.texture is None:
+            return False
+        try:
+            renderer.draw(self.texture, None, (0, 0,
+                                               config.CANVAS_WIDTH,
+                                               config.CANVAS_HEIGHT))
+            return True
+        except Exception as e:
+            logging.getLogger("video_view").debug(
+                "Не удалось нарисовать GPU-текстуру видео: %s", e)
+            return False

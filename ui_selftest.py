@@ -124,10 +124,37 @@ def check_conversion():
     print("I420 -> RGB: OK")
 
 
+def check_rgb_caps():
+    """sample_to_surface() не должен падать на RGB caps (UnboundLocalError caps_str)."""
+    if not video_view._HAVE_GST:
+        print("sample_to_surface RGB caps: пропуск (нет GStreamer)")
+        return
+    import gi
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+    Gst.init(None)
+
+    # Создаём caps для RGB и буфер с данными
+    caps = Gst.Caps.from_string("video/x-raw,format=RGB,width=480,height=320")
+    buf = Gst.Buffer.new_allocate(None, 480 * 320 * 3, None)
+    buf.fill(0, bytes([255, 0, 0]) * (480 * 320))
+
+    sample = Gst.Sample.new(buf, caps, None, None)
+    surf = video_view.sample_to_surface(sample)
+    assert surf is not None, "sample_to_surface вернул None для RGB caps"
+    assert surf.get_size() == (480, 320)
+    print("sample_to_surface RGB caps: OK")
+
+
 def check_input():
     """Клавиатура и мышь должны переключать экраны и запись."""
     rec = StubRecorder()
     u = ui.UI(rec, video_view.VideoView())
+
+    # need_ui_redraw должен работать 2 раза подряд без AttributeError
+    s1 = u.need_ui_redraw(rec.status())
+    s2 = u.need_ui_redraw(rec.status())
+    assert isinstance(s1, bool) and isinstance(s2, bool)
 
     # меню битрейта: открыть, выбрать второй пункт, применить
     u.handle_event(key(pygame.K_b))
@@ -233,6 +260,7 @@ def main():
     pygame.init()
     print("=== Проверка интерфейса (без свистка) ===")
     check_conversion()
+    check_rgb_caps()
     check_input()
     print("Экраны:")
     draw_screens()

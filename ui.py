@@ -116,9 +116,11 @@ class UI:
         self.fonts = Fonts()
         self.text = TextCache(self.fonts)
 
-        self.screen = "live"                 # "live" | "menu" | "recordings"
+        self.screen = "live"                 # "live" | "menu" | "recordings" | "capture_mode"
         self.menu_index = 0
         self.rec_index = 0                   # выделенная запись в браузере
+        self.capture_mode_index = 0          # выделенный режим захвата
+        self.capture_mode_items = []         # список режимов [(fmt, w, h, fps, label), ...]
         self.menu_items = [
             (key,
              config.BITRATE_PRESETS[key]["label"],
@@ -137,15 +139,22 @@ class UI:
         self._diag_t = 0.0
         self._diag = {"usb": None, "video": None}
         self._panel_cache = {}
+        # Кэш отрисованных строк диагностики (пересчитываем только при изменении данных)
+        self._diag_lines_cache = None
+        self._diag_cache_key = None
+        # Ключ кэша UI: меняется только когда реально изменились данные
+        self._ui_cache_key = None
 
     # -----------------------------------------------------------------
     # Плашки (полупрозрачные, со скруглёнными углами)
     # -----------------------------------------------------------------
-    def _fit_text(self, text, font, max_width):
+    def _fit_text(self, text, font_size, max_width, bold=False):
         """
         Обрезать текст с добавлением '...' если он не влезает в max_width.
         Для неразрывных строк (пути к устройствам).
+        bold — использовать ли жирный шрифт для измерения ширины (он шире!).
         """
+        font = self.fonts.get(font_size, bold)
         surf = font.render(text, True, (255, 255, 255))
         if surf.get_width() <= max_width:
             return text
@@ -202,7 +211,31 @@ class UI:
     # -----------------------------------------------------------------
     # Отрисовка
     # -----------------------------------------------------------------
+    def _ui_cache_key_from_status(self, status):
+        """Ключ кэша UI: меняется только когда реально изменились данные."""
+        return (
+            self.screen,
+            status.get("state"),
+            status.get("rec_state"),
+            int(status.get("rec_elapsed", 0)),      # таймер — точность 1 с
+            status.get("bitrate_key"),
+            None if status.get("free_mb") is None else int(status.get("free_mb")),
+            status.get("message"),
+        )
+
+    def need_ui_redraw(self, status):
+        """True, если нужно перерисовать интерфейс (изменился статус/экран)."""
+        key = self._ui_cache_key_from_status(status)
+        if key != self._ui_cache_key:
+            self._ui_cache_key = key
+            return True
+        return False
+
     def draw(self, canvas, status):
+        """
+        Отрисовать интерфейс на canvas (pygame.Surface 480x320).
+        В GPU-режиме main.py скопирует canvas в ui_tex и нарисует через Renderer.
+        """
         canvas.fill(config.BLACK)
         rect = config.video_rect_on_canvas()
         self.video.draw(canvas, rect)
@@ -215,6 +248,8 @@ class UI:
             self._draw_recordings(canvas, status)
         elif self.screen == "diag":
             self._draw_diag(canvas, status)
+        elif self.screen == "capture_mode":
+            self._draw_capture_mode_menu(canvas, status)
         else:
             self._draw_live(canvas, status)
 
@@ -341,8 +376,7 @@ class UI:
         video = self._diag.get("video")
         dev_name = os.path.basename(video) if video else "не найдено"
         # Обрезаем длинное имя устройства, чтобы не вылезало за рамки модалки
-        font = self.fonts.get(config.FONT_SIZE_NORMAL)
-        dev_name = self._fit_text(dev_name, font, 340 - 40)
+        dev_name = self._fit_text(dev_name, config.FONT_SIZE_NORMAL, 340 - 40)
         lines = [
             status.get("message") or "Свисток захвата не подключён к USB",
             "",
@@ -421,6 +455,93 @@ class UI:
                                 config.FONT_SIZE_SMALL, config.TEXT_DIM)
         canvas.blit(hint, (MENU_RECT.centerx - hint.get_width() // 2,
                            MENU_RECT.bottom - 24))
+
+    def _draw_capture_mode_menu(self, canvas, status):
+        """Отрисовка меню выбора режима захвата (разрешение, FPS, формат)."""
+        # затемняем видео под меню
+        overlay = pygame.Surface(canvas.get_size(), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        canvas.blit(overlay, (0, 0))
+
+        panel = pygame.Rect(24, 30, config.CANVAS_WIDTH - 48, config.CANVAS_HEIGHT - 60)
+        canvas.blit(self._panel(panel, config.PANEL_GRAPHITE_DARK,
+                                config.PANEL_BORDER), (panel.x, panel.y))
+
+        title = self.text.render("РЕЖИМ ЗАХВАТА", config.FONT_SIZE_LARGE,
+                                 config.SONY_ORANGE, bold=True)
+        canvas.blit(title, (panel.x + 16, panel.y + 10))
+
+        # подсказка о записи
+        if status["rec_state"] == config.REC_RUNNING:
+            warn = self.text.render("Запись активна — смена режима недоступна",
+                                    config.FONT_SIZE_SMALL, config.WARNING_YELLOW)
+            canvas.blit(warn, (panel.x + 16, panel.bottom - 24))
+            return
+
+        # список режимов
+        items = self.capture_mode_items
+        if not items:
+            empty = self.text.render("Режимы не найдены", config.FONT_SIZE_NORMAL,
+                                     config.TEXT_DIM)
+            canvas.blit(empty, (panel.x + 16, panel.y + 44))
+            return
+
+        item_h = 30
+        visible = (panel.height - 60) // item_h
+        start = max(0, min(self.capture_mode_index, len(items) - visible)) if visible > 0 else 0
+        end = min(len(items), start + visible)
+
+        for i in range(start, end):
+            f, w, h, fps, label = items[i]
+            y = panel.y + 60 + (i - start) * item_h
+            active = (i == self.capture_mode_index)
+            current = (f == config.CAPTURE_FORMAT and w == config.CAPTURE_WIDTH
+                       and h == config.CAPTURE_HEIGHT
+                       and abs(fps - config.CAPTURE_FPS) < 0.5)
+            if active:
+                canvas.blit(self._panel((panel.x + 8, y - 2,
+                                         panel.width - 16, item_h),
+                                        config.BUTTON_ACTIVE), (panel.x + 8, y - 2))
+            name_color = config.TEXT_MAIN if active else (
+                config.SONY_ORANGE if current else config.TEXT_DIM)
+            name = self.text.render(label, config.FONT_SIZE_NORMAL,
+                                    name_color, bold=active)
+            canvas.blit(name, (panel.x + 16, y))
+
+        if len(items) > visible:
+            hint = self.text.render("↑↓ — выбор   Enter — применить   Esc — назад",
+                                    config.FONT_SIZE_SMALL, config.TEXT_DIM)
+        else:
+            hint = self.text.render("Enter — применить   Esc — назад",
+                                    config.FONT_SIZE_SMALL, config.TEXT_DIM)
+        canvas.blit(hint, (panel.centerx - hint.get_width() // 2,
+                           panel.bottom - 24))
+
+    def _apply_capture_mode(self):
+        """Применить выбранный режим захвата."""
+        if not self.capture_mode_items:
+            return
+        f, w, h, fps, label = self.capture_mode_items[self.capture_mode_index]
+        changed = False
+        if config.CAPTURE_FORMAT != f:
+            config.CAPTURE_FORMAT = f
+            changed = True
+        if config.CAPTURE_WIDTH != w:
+            config.CAPTURE_WIDTH = w
+            changed = True
+        if config.CAPTURE_HEIGHT != h:
+            config.CAPTURE_HEIGHT = h
+            changed = True
+        if abs(config.CAPTURE_FPS - fps) > 0.5:
+            config.CAPTURE_FPS = fps
+            changed = True
+        if changed:
+            self.screen = "live"
+            self.notify("Режим захвата: %s" % label)
+            # Перезапускаем захват с новыми параметрами
+            self.rec.set_capture_mode(f, w, h, fps)
+        else:
+            self.screen = "live"
 
     # --- всплывающее сообщение ----------------------------------------
     def notify(self, text, ok=True, seconds=2.0):
@@ -553,7 +674,20 @@ class UI:
             elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self._apply_bitrate()
             return
-        if self.screen == "recordings":
+        if self.screen == "capture_mode":
+            items = self.capture_mode_items
+            if not items:
+                self.screen = "live"
+                return
+            if key == pygame.K_ESCAPE:
+                self.screen = "live"
+            elif key == pygame.K_UP:
+                self.capture_mode_index = max(0, self.capture_mode_index - 1)
+            elif key == pygame.K_DOWN:
+                self.capture_mode_index = min(len(items) - 1, self.capture_mode_index + 1)
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self._apply_capture_mode()
+            return
             files = self._list_recordings()
             if key == pygame.K_ESCAPE:
                 self.screen = "live"
@@ -561,7 +695,7 @@ class UI:
                 self.rec_index = max(0, self.rec_index - 1)
             elif key == pygame.K_DOWN and files:
                 self.rec_index = min(len(files) - 1, self.rec_index + 1)
-            elif key in (pygame.K_DELETE, pygame.K_KP_DELETE) and files:
+            elif key in (pygame.K_DELETE,) and files:
                 self._delete_recording()
             return
         if self.screen == "diag":
@@ -595,6 +729,12 @@ class UI:
         self._press_pos = None
         if dt > config.SWIPE_MAX_TIME_S:
             return
+        # Свайп вниз от левого верхнего угла — открыть меню режимов захвата
+        if (abs(dy) >= config.SWIPE_MIN_DISTANCE and dy > 0
+                and self._press_pos[0] < 90 and self._press_pos[1] < 70
+                and self.screen == "live"):
+            self.open_capture_mode_menu()
+            return
         if abs(dy) >= config.SWIPE_MIN_DISTANCE:
             self._on_swipe(1 if dy > 0 else -1)
         elif abs(dx) <= config.CLICK_MAX_DISTANCE and abs(dy) <= config.CLICK_MAX_DISTANCE:
@@ -605,6 +745,10 @@ class UI:
             self.menu_index = (self.menu_index + direction) % len(self.menu_items)
 
     def _on_tap(self, pos):
+        # Тап по верхней левой зоне (x < 90, y < 70) — открыть меню режимов захвата
+        if pos[0] < 90 and pos[1] < 70 and self.screen == "live":
+            self.open_capture_mode_menu()
+            return
         if self.screen == "menu":
             rects = self._menu_item_rects()
             for i, rect in enumerate(rects):
@@ -616,6 +760,19 @@ class UI:
                     return
             if not MENU_RECT.collidepoint(pos):
                 self.screen = "live"
+            return
+        if self.screen == "capture_mode":
+            items = self.capture_mode_items
+            if items:
+                item_h = 30
+                panel_top = 60
+                for i in range(len(items)):
+                    y = panel_top + i * item_h
+                    if y <= pos[1] < y + item_h and pos[0] > 24 and pos[0] < config.CANVAS_WIDTH - 24:
+                        self.capture_mode_index = i
+                        self._apply_capture_mode()
+                        return
+            self.screen = "live"
             return
         if REC_BUTTON_RECT.collidepoint(pos):
             self.toggle_record()
@@ -640,6 +797,45 @@ class UI:
     def open_recordings(self):
         self.screen = "recordings"
         self.rec_index = 0
+
+    def open_capture_mode_menu(self):
+        """Открыть меню выбора режима захвата (разрешение, FPS, формат)."""
+        status = self.rec.status()
+        if status["rec_state"] == config.REC_RUNNING:
+            self.notify("Остановите запись перед сменой режима", ok=False)
+            return
+        # Собираем поддерживаемые режимы из v4l2_checker
+        path = v4l2_checker.find_video_device()
+        self.capture_mode_items = []
+        if path:
+            modes = v4l2_checker.list_modes(path, max_age=0)
+            seen = set()
+            for f, w, h, fps in modes:
+                key = (f, w, h, round(fps, 2))
+                if key in seen:
+                    continue
+                seen.add(key)
+                fmt_label = "MJPG" if f.upper() == "MJPG" else "YUYV"
+                label = "%s %dx%d@%g" % (fmt_label, w, h, fps)
+                self.capture_mode_items.append((f, w, h, fps, label))
+        if not self.capture_mode_items:
+            # Фоллбэк — текущие настройки из config
+            self.capture_mode_items = [
+                (config.CAPTURE_FORMAT, config.CAPTURE_WIDTH,
+                 config.CAPTURE_HEIGHT, config.CAPTURE_FPS,
+                 "%s %dx%d@%g" % (config.CAPTURE_FORMAT,
+                                  config.CAPTURE_WIDTH,
+                                  config.CAPTURE_HEIGHT,
+                                  config.CAPTURE_FPS))
+            ]
+        # Подсветка текущего режима
+        self.capture_mode_index = 0
+        for i, (f, w, h, fps, label) in enumerate(self.capture_mode_items):
+            if (f == config.CAPTURE_FORMAT and w == config.CAPTURE_WIDTH
+                    and h == config.CAPTURE_HEIGHT and abs(fps - config.CAPTURE_FPS) < 0.5):
+                self.capture_mode_index = i
+                break
+        self.screen = "capture_mode"
 
     def _delete_recording(self):
         files = self._list_recordings()
@@ -693,6 +889,17 @@ class UI:
         modes = self._diag.get("modes") or []
         usb = self._diag.get("usb", False)
 
+        # Ключ кэша: состояние + режимы. Если ничего не изменилось — используем кэш.
+        cache_key = (usb, dev.get("name") if dev else None, video, tuple(modes),
+                     config.CAPTURE_FORMAT, config.CAPTURE_WIDTH,
+                     config.CAPTURE_HEIGHT, config.CAPTURE_FPS)
+        if cache_key == self._diag_cache_key and self._diag_lines_cache is not None:
+            all_lines, all_colors, all_bold = self._diag_lines_cache
+        else:
+            all_lines, all_colors, all_bold = self._build_diag_lines(dev, video, modes, usb, status)
+            self._diag_lines_cache = (all_lines, all_colors, all_bold)
+            self._diag_cache_key = cache_key
+
         # затемняем видео под экраном
         overlay = pygame.Surface(canvas.get_size(), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 140))
@@ -707,52 +914,11 @@ class UI:
         canvas.blit(title, (panel.x + 16, panel.y + 10))
 
         font = self.fonts.get(config.FONT_SIZE_NORMAL)
-        max_text_w = panel.width - 32   # отступы по бокам внутри панели
+        max_text_w = panel.width - 100   # отступы + место под скроллбар справа (зазор >= 15 px)
         line_h = 17
         inner_top = panel.y + 40
         inner_bottom = panel.bottom - 24
         max_lines = (inner_bottom - inner_top) // line_h
-
-        # Собираем все строки диагностики
-        all_lines = []
-        all_colors = []
-        all_bold = []
-
-        def add(text, color=config.TEXT_DIM, bold=False):
-            # Длинные строки (пути, имена устройств) обрезаем, остальные — переносим по словам
-            if text.startswith("/dev/") or text.startswith("usb-"):
-                all_lines.append(self._fit_text(text, font, max_text_w))
-                all_colors.append(color)
-                all_bold.append(bold)
-            else:
-                for part in self._wrap_text(text, font, max_text_w):
-                    all_lines.append(part)
-                    all_colors.append(color)
-                    all_bold.append(bold)
-
-        add("Свисток в USB: " + ("да (%s)" % dev["name"] if usb else "НЕТ"),
-             config.SONY_ORANGE if usb else config.REC_RED, bold=True)
-        if dev:
-            add("  Вид/Продукт: %s:%s  (%s)" % (dev["vid"], dev["pid"], dev["name"]))
-        add("Видеоустройство: " + (os.path.basename(video) if video else "не найдено"))
-        add("Текущий режим: %s %dx%d@%g" % (
-            config.CAPTURE_FORMAT, config.CAPTURE_WIDTH,
-            config.CAPTURE_HEIGHT, config.CAPTURE_FPS))
-        add("")
-        add("Поддерживаемые режимы:", config.TEXT_MAIN, bold=True)
-        if modes:
-            for f, w, h, fps in modes:
-                add("  %s %dx%d @ %g" % (f, w, h, fps))
-        else:
-            add("  (не удалось получить — v4l2-ctl установлен?)", config.TEXT_DIM)
-        add("")
-        add("Состояние захвата: %s" % status.get("state", "?"),
-             STATE_COLORS.get(status.get("state"), config.TEXT_DIM), bold=True)
-        add("Запись: %s" % status.get("rec_state", "?"))
-        if status.get("rec_file"):
-            add("  Файл: %s" % os.path.basename(status["rec_file"]))
-        add("")
-        add("D — пересканировать   Esc — назад", config.TEXT_DIM)
 
         # Прокрутка: если строк больше чем помещается на экране
         total_lines = len(all_lines)
@@ -775,6 +941,72 @@ class UI:
             pygame.draw.rect(canvas, (100, 100, 100),
                              (panel.right - 6, sb_y, 4, sb_h))
 
+    def _build_diag_lines(self, dev, video, modes, usb, status):
+        """Собирает строки диагностики, цвета и флажи bold. Вынесен из _draw_diag для кэширования."""
+        font = self.fonts.get(config.FONT_SIZE_NORMAL)
+        max_text_w = config.CANVAS_WIDTH - 200   # отступы + место под скроллбар (зазор >= 20 px)
+
+        def add(text, color=config.TEXT_DIM, bold=False):
+            # Длинные строки (пути, имена устройств) обрезаем, остальные — переносим по словам
+            if text.startswith("/dev/") or text.startswith("usb-"):
+                all_lines.append(self._fit_text(text, config.FONT_SIZE_NORMAL,
+                                                max_text_w, bold=bold))
+            else:
+                for part in self._wrap_text(text, font, max_text_w):
+                    all_lines.append(part)
+            all_colors.append(color)
+            all_bold.append(bold)
+
+        all_lines = []
+        all_colors = []
+        all_bold = []
+
+        if usb and dev:
+            add("Свисток в USB: да (%s)" % dev.get("name", "?"),
+                 config.SONY_ORANGE, bold=True)
+        elif usb:
+            add("Свисток в USB: да (устройство не определено)",
+                 config.SONY_ORANGE, bold=True)
+        else:
+            add("Свисток в USB: НЕТ", config.REC_RED, bold=True)
+        if dev:
+            add("  Вид/Продукт: %s:%s  (%s)" % (dev.get("vid", "?"), dev.get("pid", "?"),
+                                               dev.get("name", "?")))
+        add("Видеоустройство: " + (os.path.basename(video) if video else "не найдено"))
+        add("Текущий режим: %s %dx%d@%g" % (
+            config.CAPTURE_FORMAT, config.CAPTURE_WIDTH,
+            config.CAPTURE_HEIGHT, config.CAPTURE_FPS))
+        add("")
+        add("Поддерживаемые режимы:", config.TEXT_MAIN, bold=True)
+        if modes:
+            for f, w, h, fps in modes:
+                add("  %s %dx%d @ %g" % (f, w, h, fps))
+        else:
+            add("  (не удалось получить — v4l2-ctl установлен?)", config.TEXT_DIM)
+        add("")
+        add("Состояние захвата: %s" % status.get("state", "?"),
+             STATE_COLORS.get(status.get("state"), config.TEXT_DIM), bold=True)
+        add("Запись: %s" % status.get("rec_state", "?"))
+        if status.get("rec_file"):
+            add("  Файл: %s" % os.path.basename(status["rec_file"]))
+        add("")
+        add("D — пересканировать   Esc — назад", config.TEXT_DIM)
+
+        return all_lines, all_colors, all_bold
+
+    def _max_diag_scroll(self):
+        """Максимально допустимый diag_scroll для текущего кэша линий."""
+        if self._diag_lines_cache is None:
+            return 0
+        total_lines = len(self._diag_lines_cache[0])
+        max_lines = (config.CANVAS_HEIGHT - 72) // 17
+        return max(0, total_lines - max_lines)
+
+    def _clamp_diag_scroll(self):
+        """Ограничить diag_scroll в допустимом диапазоне."""
+        max_scroll = self._max_diag_scroll()
+        self._diag["diag_scroll"] = max(0, min(self._diag.get("diag_scroll", 0), max_scroll))
+
     def _on_key_diag(self, key):
         if key == pygame.K_ESCAPE:
             self.screen = "live"
@@ -783,13 +1015,7 @@ class UI:
             self.notify("Пересканирование USB...")
         elif key == pygame.K_UP:
             self._diag["diag_scroll"] = max(0, self._diag.get("diag_scroll", 0) - 1)
+            self._clamp_diag_scroll()
         elif key == pygame.K_DOWN:
             self._diag["diag_scroll"] = self._diag.get("diag_scroll", 0) + 1
-
-    # --- управление (дополнение) ----------------------------------------
-    def _on_key_diag(self, key):
-        if key == pygame.K_ESCAPE:
-            self.screen = "live"
-        elif key == pygame.K_d:
-            self._diag_t = 0.0  # форсировать пересканирование
-            self.notify("Пересканирование USB...")
+            self._clamp_diag_scroll()

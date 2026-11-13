@@ -135,15 +135,26 @@ def capture_pipeline_desc(device, preview, decoder=None):
              "none"    — превью нет.
     decoder: чем распаковывать MJPEG (по умолчанию config.JPEG_DECODER).
     """
+    # rec_sink получает полное разрешение с устройства (W x H) — для записи.
     rec_sink = ("appsink name=rec_sink emit-signals=true sync=false "
-                "max-buffers=10 drop=true")
+                "max-buffers=1 drop=true")
+
+    # preview_sink: если разрешение устройства != 480x320, масштабируем
+    # через videoscale, чтобы холст превью всегда оставался лёгким 480x320.
+    need_scale = (config.CAPTURE_WIDTH != config.CANVAS_WIDTH or
+                  config.CAPTURE_HEIGHT != config.CANVAS_HEIGHT)
     if preview == "appsink":
+        scale_elem = "videoscale ! video/x-raw,width=%d,height=%d ! " % (
+            config.CANVAS_WIDTH, config.CANVAS_HEIGHT) if need_scale else ""
         # preview_sink: RGB — готовый формат для pygame, без конвертации на Python.
-        # Для записи (rec_sink) оставляем I420 — он нужен энкодеру.
-        prev_sink = ("videoconvert ! video/x-raw,format=RGB "
-                     "! appsink name=preview_sink sync=false max-buffers=1 drop=true")
+        prev_sink = ("%svideoconvert ! video/x-raw,format=RGB "
+                     "! appsink name=preview_sink sync=false max-buffers=1 drop=true"
+                     % scale_elem)
     elif preview == "kmssink":
-        prev_sink = "kmssink sync=false"
+        # kmssink не поддерживается в текущей версии — сразу предупреждаем и
+        # переключаемся на appsink, чтобы не было бесконечного цикла busy/DRM.
+        prev_sink = "fakesink sync=false"
+        log.warning("preview=kmssink не поддерживается — использую appsink")
     else:
         prev_sink = "fakesink sync=false"
 
@@ -326,11 +337,21 @@ class Recorder:
         """Остановить захват (если пишем — сначала закрыть запись)."""
         if self.rec_state == REC_RUNNING:
             self.stop_recording()
-        if self._capture is not None and reason != self._last_error:
+        if self._capture is not None:
             log.info("Остановка захвата: %s", reason)
-            t = _set_null_in_background(self._capture, "capture")
-            t.join(3.0)    # ждём, пока v4l2src освободит устройство (макс 3 с),
-                           # иначе следующий запуск упадёт с "Device is busy"
+            # Гарантированно переводим конвейер в NULL, чтобы v4l2src/kmssink
+            # освободили устройство перед следующим запуском. set_state(NULL)
+            # может вернуть ASYNC, поэтому ждём через get_state().
+            try:
+                self._capture.set_state(Gst.State.NULL)
+            except Exception as e:
+                log.warning("Ошибка set_state(NULL) для capture: %s", e)
+            try:
+                _ok, state, _pending = self._capture.get_state(2 * Gst.SECOND)
+                if state != Gst.State.NULL:
+                    log.warning("Конвейер захвата не перешёл в NULL за 2 с (состояние %s)", state)
+            except Exception as e:
+                log.warning("Ошибка get_state для capture: %s", e)
         self._capture = None
         self._capture_bus = None
         self._preview_sink = None
@@ -384,6 +405,12 @@ class Recorder:
             self._capture.set_state(Gst.State.NULL)
         except Exception as e:
             log.warning("Не удалось перевести конвейер захвата в NULL: %s", e)
+        try:
+            _ok, state, _pending = self._capture.get_state(2 * Gst.SECOND)
+            if state != Gst.State.NULL:
+                log.warning("Конвейер захвата не перешёл в NULL за 2 с (состояние %s)", state)
+        except Exception as e:
+            log.warning("Ошибка get_state при forced NULL: %s", e)
         self._capture = None
         self._capture_bus = None
         self._preview_sink = None
@@ -428,7 +455,8 @@ class Recorder:
                 log.log(level, "Ошибка захвата: %s (%s)", text, debug)
                 self._last_error = text
                 # Если kmssink упал с DRM/Permission denied — переключаем превью
-                # на appsink и перезапускаем захват, чтобы не висеть в busy.
+                # на appsink, гарантированно останавливаем старый конвейер и
+                # перезапускаем захват сразу (не ждём DEVICE_RETRY_INTERVAL_S).
                 if ("permission denied" in text.lower()
                         or "drmmodesetplane" in text.lower()
                         or "kmssink" in text.lower()):
@@ -436,6 +464,12 @@ class Recorder:
                         log.warning("kmssink упал (%s) — переключаю превью на appsink", text)
                         self._preview_failed = True
                         self.preview_mode = "appsink"
+                        # Останавливаем старый конвейер в NULL и освобождаем устройство,
+                        # иначе следующий запуск упадёт с "Device is busy"
+                        self._stop_capture("kmssink ошибка, перезапуск с appsink", no_frames=False)
+                        # Не ждём таймаута — пробуем запустить с appsink сразу
+                        self._next_retry_t = 0.0
+                    return
                 if "busy" in text.lower():
                     text = "Свисток занят другой программой (закройте gst-launch)"
                 self._stop_capture(text)
@@ -556,6 +590,21 @@ class Recorder:
         self.rec_state = REC_RUNNING
         log.info("Запись начата: %s (%s)", filename, config.BITRATE_PRESETS[self.bitrate_key]["label"])
         return True, "Запись: " + os.path.basename(filename)
+
+    def set_capture_mode(self, fmt, width, height, fps):
+        """
+        Установить режим захвата и мягко перезапустить конвейер захвата.
+        Вызывается из меню выбора режима (UI).
+        """
+        config.CAPTURE_FORMAT = fmt
+        config.CAPTURE_WIDTH = width
+        config.CAPTURE_HEIGHT = height
+        config.CAPTURE_FPS = fps
+        log.info("Смена режима захвата: %s %dx%d@%g" % (fmt, width, height, fps))
+        # Мягко перезапускаем конвейер захвата с новыми параметрами
+        self._stop_capture("Смена режима захвата", no_frames=False)
+        self._next_retry_t = 0.0   # не ждём таймаута — пробуем сразу
+        self._start_capture()
 
     def stop_recording(self):
         """Остановить запись. Файл закрывается в фоне за доли секунды (см. poll())."""
