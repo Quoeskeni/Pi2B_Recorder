@@ -343,7 +343,7 @@ def main():
                     log.error("Не удалось обновить GPU-текстуру: %s", exc2)
                     return
             renderer.clear()
-            renderer.draw(_tex_container[0], None,
+            _tex_container[0].draw(None,
                           pygame.Rect(0, 0, config.CANVAS_WIDTH, config.CANVAS_HEIGHT))
             renderer.present()
     elif canvas.get_size() == (config.CANVAS_WIDTH, config.CANVAS_HEIGHT):
